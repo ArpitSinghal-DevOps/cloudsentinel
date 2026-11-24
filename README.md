@@ -15,15 +15,17 @@ Everything stays inside the AWS free tier. A $5 budget alarm is the first thing 
 | Phase | What | State |
 |---|---|---|
 | 1 | Bootstrap: state bucket, GitHub OIDC roles, budget | done |
-| 2 | Main stack + CI (fmt, validate, TFLint, Checkov, plan on PR, apply on main) | next |
-| 3 | Auto-remediation: CloudTrail → EventBridge → Lambda → SNS | |
+| 2 | Main stack + CI (fmt, validate, TFLint, Checkov, plan on PR, apply on main) | done |
+| 3 | Auto-remediation: CloudTrail → EventBridge → Lambda → SNS | next |
 | 4 | Docs, demo, screenshots | |
 
 ## Layout
 
 ```
 bootstrap/     one-time setup, applied from a laptop with admin credentials
+infra/         the main stack, applied only by CI
 scripts/tf     runs Terraform from the official Docker image (nothing to install)
+.github/workflows/terraform.yml
 ```
 
 ## Bootstrap
@@ -86,6 +88,42 @@ After that it's a normal stack: `../scripts/tf plan`, `../scripts/tf apply`.
 
 `terraform.tfvars`, `backend.hcl` and `*_override.tf` are git-ignored, so the alert email and the account id
 stay out of the repo.
+
+## CI
+
+`.github/workflows/terraform.yml` has three jobs:
+
+| Job | Runs on | What it does |
+|---|---|---|
+| checks | every PR and every push to main | `terraform fmt`, `validate` (both stacks), TFLint with the AWS ruleset, Checkov, Gitleaks |
+| plan | PRs | assumes `cloudsentinel-gha-plan` through OIDC, runs `terraform plan` for `infra/` |
+| apply | main | assumes `cloudsentinel-gha-apply`, plans, then applies that saved plan |
+
+plan and apply only start if checks pass. The repo has four secrets: the two role ARNs, the state
+bucket name and the alert email. There are no AWS keys anywhere. The account id is masked in the logs,
+and the email is a sensitive variable, so the plan shows `(sensitive value)`.
+
+`main` is protected: changes go through a PR, the checks and plan jobs must pass, and force-pushes
+and deletes are blocked.
+
+**Pre-deploy gate in action:** [PR #2](https://github.com/ArpitSinghal-DevOps/cloudsentinel/pull/2)
+adds a bucket with public access blocks off and a `Principal: "*"` policy. Checkov fails it with 12
+findings (CKV_AWS_53/54/55/56 for the access blocks, CKV_AWS_70 for the wildcard principal), so the
+plan never runs. The PR stays open on purpose.
+
+### The OIDC subject gotcha
+
+The first plan run failed with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. CloudTrail
+showed the token's subject:
+
+```
+repo:ArpitSinghal-DevOps@144610884/cloudsentinel@1470357600:pull_request
+```
+
+GitHub includes the numeric owner and repo ids in the subject, so a trust policy matching
+`repo:ArpitSinghal-DevOps/cloudsentinel:*` never matches. The roles now pin both ids. That is stricter
+too: if the repo were deleted and someone re-created one with the same name, it would get a new id and
+could not assume the roles.
 
 ## Cost
 
