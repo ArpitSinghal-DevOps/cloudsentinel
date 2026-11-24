@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Runs Terraform from the official image so nothing has to be installed locally.
+# Usage (from any folder in the repo):  ../scripts/tf plan
+set -euo pipefail
+
+TF_VERSION="${TF_VERSION:-1.16.7}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REL="${PWD#"$ROOT"}"
+
+TTY=()
+[[ -t 0 && -t 1 ]] && TTY=(-t)
+
+exec docker run --rm -i "${TTY[@]}" \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp/home \
+  -e AWS_PROFILE -e AWS_REGION \
+  -e TF_PLUGIN_CACHE_DIR=/tmp/plugin-cache \
+  -v "$HOME/.aws:/tmp/home/.aws:ro" \
+  -v cloudsentinel-tf-plugins:/tmp/plugin-cache \
+  -v "$ROOT:/repo" -w "/repo$REL" \
+  "hashicorp/terraform:$TF_VERSION" "$@"
