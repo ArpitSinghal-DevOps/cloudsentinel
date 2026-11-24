@@ -2,30 +2,113 @@
 
 Guardrails for a small AWS account, built with Terraform and GitHub Actions.
 
-The idea is to catch the same mistake in three places:
+The same mistake, a publicly readable S3 bucket, gets caught in three places:
 
-1. **Before deploy**: Terraform changes are scanned in CI, so a public bucket or an over-broad IAM policy never gets applied.
-2. **During deploy**: CI talks to AWS through OIDC with short-lived credentials. There are no access keys in GitHub.
-3. **After deploy**: if someone makes a bucket public by hand in the console, CloudTrail picks it up, EventBridge triggers a Lambda, and the bucket is locked down again with an email alert.
+1. **Before deploy.** Every Terraform change is scanned in CI. A public bucket or an over-broad IAM policy fails the build and never reaches AWS.
+2. **During deploy.** CI gets short-lived AWS credentials through OIDC. There are no access keys in GitHub, PRs can only plan, and only `main` can apply.
+3. **After deploy.** If someone opens a bucket by hand in the console, CloudTrail records it, EventBridge triggers a Lambda, and Block Public Access is back on within about 10 seconds, with an email saying who did what.
 
-Everything stays inside the AWS free tier. A $5 budget alarm is the first thing that gets created.
+Everything runs inside the AWS free tier, behind a $5 budget alarm.
 
-## Status
+## Architecture
 
-| Phase | What | State |
+```mermaid
+flowchart TB
+  subgraph gh[GitHub]
+    pr[Pull request] --> checks[checks<br/>fmt · validate · TFLint<br/>Checkov · Gitleaks · pytest]
+    checks -->|PR| plan[plan<br/>read-only role]
+    checks -->|main| apply[apply<br/>scoped role]
+  end
+
+  plan -. OIDC .-> aws
+  apply -. OIDC .-> aws
+
+  subgraph aws[AWS account]
+    direction TB
+    person([someone in the console]) -->|opens bucket| demo[(S3 bucket)]
+    demo -. API call .-> trail[CloudTrail]
+    trail --> rule[EventBridge rule]
+    rule --> fn[Lambda<br/>remediate-s3]
+    fn -->|Block Public Access back on| demo
+    fn --> sns[SNS topic] --> mail([email alert])
+  end
+```
+
+## See it work
+
+**A public bucket in a PR never gets past CI.**
+[PR #2](https://github.com/ArpitSinghal-DevOps/cloudsentinel/pull/2) adds a bucket with the public access
+blocks off and a `Principal: "*"` policy. Checkov fails the checks job with 12 findings, so plan never runs,
+and the branch rules keep the PR from being merged.
+
+![Checkov blocks the public bucket](docs/img/ci-checkov-blocks-public-bucket.png)
+
+**Normal changes go PR → plan → merge → apply,** with no AWS keys stored anywhere:
+
+![plan on a pull request](docs/img/ci-plan-pr.png)
+![apply on main](docs/img/ci-apply-main.png)
+
+**A bucket opened by hand is closed again in about 10 seconds.** Output of `scripts/demo-public-bucket.sh`:
+
+```
+22:22:41  start: block public access = True True True True, anonymous GET = 403
+22:22:45  removed Block Public Access
+22:22:47  public-read policy added, anonymous GET = 200
+22:22:53  Block Public Access back on after 10s, anonymous GET = 403
+```
+
+and the email that follows:
+
+```
+Subject: [CloudSentinel] public access removed from cloudsentinel-demo-<account-id>
+
+Bucket cloudsentinel-demo-<account-id> was opened up and has been locked down again.
+
+Change:      DeleteBucketPublicAccessBlock
+Made by:     arn:aws:iam::<account-id>:user/arpit
+Was off:     BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets
+Policy was public: no
+
+All four Block Public Access settings are back on. The bucket policy and ACL were not touched.
+If this bucket really should be public, tag it cloudsentinel:allow-public=true.
+```
+
+## What it protects against
+
+| Risk | Control | Where |
 |---|---|---|
-| 1 | Bootstrap: state bucket, GitHub OIDC roles, budget | done |
-| 2 | Main stack + CI (fmt, validate, TFLint, Checkov, plan on PR, apply on main) | done |
-| 3 | Auto-remediation: CloudTrail → EventBridge → Lambda → SNS | done |
-| 4 | Docs, demo, screenshots | next |
+| A public or unencrypted bucket written in Terraform | Checkov fails the PR | CI, before plan |
+| An IAM policy with `*` actions or resources | Checkov (CKV_AWS_109/111/356...) | CI |
+| A secret committed to the repo | Gitleaks | CI |
+| Leaked CI credentials | No stored keys; OIDC tokens last one hour and are tied to this repo's id | AWS STS |
+| A PR changing real infrastructure | The PR role is read-only; only `main` can assume the apply role | IAM trust policy |
+| CI making itself admin | The apply role can only create roles under `/cloudsentinel/` with a permissions boundary, and can't remove it | IAM |
+| CI deleting the Terraform state | Explicit denies on the state bucket | IAM |
+| A bucket opened by hand in the console | CloudTrail → EventBridge → Lambda turns Block Public Access back on | Runtime |
+| A surprise bill | $5 budget alarm; the CI role can't create EC2, NAT or anything billed hourly | Budgets, IAM |
+
+## Design decisions
+
+- **OIDC instead of access keys.** Nothing long-lived to leak or rotate. The trust policies pin the GitHub
+  owner and repo *ids*, not just names (see [the OIDC subject gotcha](#the-oidc-subject-gotcha)).
+- **Two CI roles.** Pull requests come from branches anyone with write access can push to, so they only get
+  read access. Applying is limited to `main`, which is protected.
+- **A permissions boundary on everything CI creates.** Any role that can create IAM roles can escalate. The
+  boundary caps every workload role at "close buckets, publish alerts, write logs".
+- **Turn Block Public Access back on; don't delete the policy.** It closes the bucket just as well, it can be
+  undone, and nothing in the bucket policy is lost.
+- **An opt-out tag** (`cloudsentinel:allow-public=true`), because some buckets really are meant to be public,
+  such as a static website.
+- **Free-tier only.** SSE-S3 instead of KMS keys, one trail for management events only, no VPC for the
+  Lambda. Each Checkov check skipped for these reasons has the reason next to it in the code.
 
 ## Layout
 
 ```
-bootstrap/     one-time setup, applied from a laptop with admin credentials
-infra/         the main stack, applied only by CI
-infra/lambda/remediate_s3/   remediation Lambda and its tests
-scripts/tf     runs Terraform from the official Docker image (nothing to install)
+bootstrap/                      one-time setup, applied from a laptop with admin credentials
+infra/                          the main stack, applied only by CI
+infra/lambda/remediate_s3/      remediation Lambda and its tests
+scripts/tf                      runs Terraform from the official Docker image (nothing to install)
 scripts/demo-public-bucket.sh   opens the demo bucket and times the fix
 .github/workflows/terraform.yml
 ```
@@ -160,14 +243,7 @@ event without a bucket). Removing the actual fix from the handler makes 3 of the
 ### Tested live
 
 `scripts/demo-public-bucket.sh` uploads a file, removes Block Public Access, adds a public-read policy
-and times how long until it's closed again:
-
-```
-22:22:41  start: block public access = True True True True, anonymous GET = 403
-22:22:45  removed Block Public Access
-22:22:47  public-read policy added, anonymous GET = 200
-22:22:53  Block Public Access back on after 10s, anonymous GET = 403
-```
+and times how long until it's closed again. Its output is at the top of this README.
 
 On another run the Lambda was quicker than the second step, and S3 refused the public policy outright:
 
@@ -199,3 +275,17 @@ hundred KB. Phase 3 adds one CloudTrail trail (write management events, free as 
 a few KB a day and expire after 30 days), an EventBridge rule on AWS service events (free), and a Lambda
 and an SNS topic that stay well inside their free tiers. Nothing that bills by the hour (NAT
 gateways, load balancers, EC2, RDS), and the CI role can't create any of it.
+
+## Tearing it down
+
+To get back to zero, remove the main stack first (it needs the roles and the state bucket), then the bootstrap.
+
+```bash
+cd infra
+../scripts/tf init -backend-config=bucket=cloudsentinel-tfstate-<account-id>
+../scripts/tf destroy
+
+cd ../bootstrap
+# the state bucket has prevent_destroy; remove that line first, and empty the bucket
+../scripts/tf destroy
+```
