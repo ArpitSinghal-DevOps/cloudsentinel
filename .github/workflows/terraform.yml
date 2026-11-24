@@ -68,6 +68,16 @@ jobs:
       - name: Gitleaks
         run: docker run --rm -v "$PWD:/repo" "$GITLEAKS_IMAGE" git /repo --redact --log-opts=HEAD
 
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13" # same as the Lambda runtime
+
+      - name: Lambda tests
+        working-directory: infra/lambda/remediate_s3
+        run: |
+          pip install -r requirements-dev.txt
+          python -m pytest -q tests
+
   plan:
     name: plan
     needs: checks

@@ -18,3 +18,6 @@ backend.hcl
 __pycache__/
 .venv/
 .pytest_cache/
+
+# Lambda zips built by terraform
+.build/
