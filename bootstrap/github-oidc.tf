@@ -10,6 +10,10 @@ resource "aws_iam_openid_connect_provider" "github" {
 locals {
   oidc_sub = "token.actions.githubusercontent.com:sub"
   oidc_aud = "token.actions.githubusercontent.com:aud"
+
+  github_owner = split("/", var.github_repo)[0]
+  github_name  = split("/", var.github_repo)[1]
+  oidc_subject = "repo:${local.github_owner}@${var.github_owner_id}/${local.github_name}@${var.github_repo_id}"
 }
 
 data "aws_iam_policy_document" "plan_trust" {
@@ -27,7 +31,7 @@ data "aws_iam_policy_document" "plan_trust" {
     condition {
       test     = "StringEquals"
       variable = local.oidc_sub
-      values   = ["repo:${var.github_repo}:pull_request"]
+      values   = ["${local.oidc_subject}:pull_request"]
     }
   }
 }
@@ -47,7 +51,7 @@ data "aws_iam_policy_document" "apply_trust" {
     condition {
       test     = "StringEquals"
       variable = local.oidc_sub
-      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
+      values   = ["${local.oidc_subject}:ref:refs/heads/main"]
     }
   }
 }
