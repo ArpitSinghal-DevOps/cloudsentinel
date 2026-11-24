@@ -1,0 +1,5 @@
+bucket       = "cloudsentinel-tfstate-<account-id>"
+key          = "bootstrap/terraform.tfstate"
+region       = "eu-north-1"
+use_lockfile = true
+encrypt      = true
