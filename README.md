@@ -16,15 +16,17 @@ Everything stays inside the AWS free tier. A $5 budget alarm is the first thing 
 |---|---|---|
 | 1 | Bootstrap: state bucket, GitHub OIDC roles, budget | done |
 | 2 | Main stack + CI (fmt, validate, TFLint, Checkov, plan on PR, apply on main) | done |
-| 3 | Auto-remediation: CloudTrail → EventBridge → Lambda → SNS | next |
-| 4 | Docs, demo, screenshots | |
+| 3 | Auto-remediation: CloudTrail → EventBridge → Lambda → SNS | done |
+| 4 | Docs, demo, screenshots | next |
 
 ## Layout
 
 ```
 bootstrap/     one-time setup, applied from a laptop with admin credentials
 infra/         the main stack, applied only by CI
+infra/lambda/remediate_s3/   remediation Lambda and its tests
 scripts/tf     runs Terraform from the official Docker image (nothing to install)
+scripts/demo-public-bucket.sh   opens the demo bucket and times the fix
 .github/workflows/terraform.yml
 ```
 
@@ -125,9 +127,75 @@ GitHub includes the numeric owner and repo ids in the subject, so a trust policy
 too: if the repo were deleted and someone re-created one with the same name, it would get a new id and
 could not assume the roles.
 
+## Auto-remediation
+
+```
+someone turns off Block Public Access / adds a public policy or ACL
+        │
+CloudTrail (management event)
+        │
+EventBridge rule cloudsentinel-s3-public-access
+        │   PutBucketAcl, PutBucketPolicy, Put/DeleteBucketPublicAccessBlock
+        ▼
+Lambda cloudsentinel-remediate-s3
+        ├─ bucket tagged cloudsentinel:allow-public=true?  → leave it
+        ├─ all four Block Public Access settings already on? → nothing to do
+        ├─ otherwise turn all four back on
+        └─ email the alerts topic: which bucket, what changed, who did it
+```
+
+The Lambda doesn't delete the bucket policy or reset the ACL. With all four Block Public Access settings
+on, S3 ignores public ACLs and public policies anyway, so turning them back on is enough, and nothing
+someone wrote into the policy is lost. The fix itself produces a `PutBucketPublicAccessBlock` event that
+comes back through EventBridge; the Lambda sees the bucket is already closed and stops there, so it can't loop.
+
+The Lambda role sits under `/cloudsentinel/` with the workload boundary. Its own policy only allows reading
+bucket tags and public-access status, turning Block Public Access on, publishing to the alerts topic and
+writing its logs. It can't read objects.
+
+Tests: 8 unit tests with [moto](https://github.com/getmoto/moto), run in the CI checks job (public bucket
+gets closed, policy left untouched, already-closed is a no-op, allow-public tag respected, deleted bucket,
+event without a bucket). Removing the actual fix from the handler makes 3 of them fail.
+
+### Tested live
+
+`scripts/demo-public-bucket.sh` uploads a file, removes Block Public Access, adds a public-read policy
+and times how long until it's closed again:
+
+```
+22:22:41  start: block public access = True True True True, anonymous GET = 403
+22:22:45  removed Block Public Access
+22:22:47  public-read policy added, anonymous GET = 200
+22:22:53  Block Public Access back on after 10s, anonymous GET = 403
+```
+
+On another run the Lambda was quicker than the second step, and S3 refused the public policy outright:
+
+```
+22:21:03  removed Block Public Access
+          PutBucketPolicy → AccessDenied: public policies are prevented by the BlockPublicPolicy setting
+22:21:08  Lambda: {"status": "remediated", "trigger": "DeleteBucketPublicAccessBlock", "actor": "...:user/arpit", ...}
+```
+
+The alert email arrives a few seconds later.
+
+One thing I hit: the very first test, a few minutes after the apply that created the trail and the rule,
+wasn't caught at all. The rule matched the event (checked with `aws events test-event-pattern`), but nothing
+reached it. A few minutes later every attempt was caught within 5 to 10 seconds. So a change made right after
+a fresh deploy can slip through. A periodic sweep of all buckets would close that gap (see below).
+
+### Not covered
+
+- Account-level Block Public Access. Turning that on is the stronger fix for an account that never needs
+  public buckets; this project handles the bucket level so there is something to demo.
+- Object ACLs, and buckets made public through an access point.
+- Changes that happen while EventBridge isn't delivering (like the case above). A scheduled Lambda that
+  checks every bucket once a day would catch those.
+
 ## Cost
 
 Everything here is free: IAM, OIDC and the first budget cost nothing, and the state bucket holds a few
-hundred KB. The later phases use one CloudTrail trail (management events only, free), EventBridge for AWS
-service events (free), and Lambda and SNS within their free tiers. Nothing that bills by the hour (NAT
+hundred KB. Phase 3 adds one CloudTrail trail (write management events, free as the first trail; the log files are
+a few KB a day and expire after 30 days), an EventBridge rule on AWS service events (free), and a Lambda
+and an SNS topic that stay well inside their free tiers. Nothing that bills by the hour (NAT
 gateways, load balancers, EC2, RDS), and the CI role can't create any of it.
